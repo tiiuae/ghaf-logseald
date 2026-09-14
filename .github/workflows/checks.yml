@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2022-2026 TII (SSRC) and the Ghaf contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 512MiB
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - run: nix fmt -- --fail-on-change
+      - run: nix develop --command reuse --no-multiprocessing lint
+      - run: nix develop --command go test -p 1 -count=1 ./...
+      - run: nix develop --command go vet -p 1 ./...
+      - run: nix flake check --max-jobs 1 --cores 2
