@@ -12,13 +12,13 @@ import (
 	"sort"
 )
 
-// Limits bound evidence and its replay index. Reaching a limit never deletes
-// evidence or resets a chain. Operators must provision additional capacity.
 type Limits struct {
-	Bytes        int64
-	Entries      int
-	ChainBytes   int64
-	ChainEntries int
+	Bytes         int64
+	Entries       int
+	ChainBytes    int64
+	ChainEntries  int
+	WindowEntries int
+	Compact       bool
 }
 
 var ErrCapacity = errors.New("logseald evidence capacity reached; provision capacity before resuming")
@@ -35,7 +35,7 @@ func chooseLimits(defaults Limits, supplied []Limits) (Limits, error) {
 	if len(supplied) == 1 {
 		defaults = supplied[0]
 	}
-	if defaults.Bytes < 1 || defaults.Entries < 1 || defaults.ChainBytes < 0 || defaults.ChainEntries < 0 {
+	if defaults.Bytes < 1 || defaults.Entries < 1 || defaults.ChainBytes < 0 || defaults.ChainEntries < 0 || defaults.WindowEntries < 0 || defaults.WindowEntries > defaults.Entries {
 		return Limits{}, fmt.Errorf("invalid storage policy")
 	}
 	return defaults, nil

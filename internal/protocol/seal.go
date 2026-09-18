@@ -137,6 +137,13 @@ func VerifySealResponse(request SealRequest, response SealResponse, pinned ed255
 	if response.Version != ProtocolVersion || response.RequestID != request.RequestID || response.BlockID != request.BlockID || response.ChainID != block.ChainID || response.ProducerSequence != block.ProducerSequence {
 		return nil, fmt.Errorf("seal response does not match request")
 	}
+	return VerifyReceipt(response, pinned)
+}
+
+func VerifyReceipt(response SealResponse, pinned ed25519.PublicKey) (ed25519.PublicKey, error) {
+	if response.Version != ProtocolVersion || !requestIDPattern.MatchString(response.RequestID) || response.ProducerSequence == 0 {
+		return nil, fmt.Errorf("invalid seal receipt")
+	}
 	if response.Epoch != 0 || response.SealSequence == 0 || response.Backend != SoftBackend {
 		return nil, fmt.Errorf("unsupported seal response backend or sequence")
 	}

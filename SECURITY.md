@@ -23,8 +23,14 @@ certificate expiry; explicit revocation requires policy deployment and restart.
 - No proof of truthful or complete event reporting, and no log-content encryption.
 - Ghaf GUI/app VM users can access shared GIVC keys and impersonate producers.
   Private systemd credential copies do not solve that provisioning limitation.
-- Bounded queues and finite evidence capacity; no automatic evidence pruning.
-  Long outages can leave records unsigned or lost to journal retention.
+- Producers expire acknowledged evidence by sequence and byte budget. Expired
+  contents are not locally verifiable. Signed boundaries do not guarantee a
+  minimum retention period or prevent malicious prefix truncation or rollback.
+- Compact sealer state retains only current chain heads and each chain's latest
+  retry receipt. Older retries are rejected. A signed checkpoint is not an archive
+  or a globally append-only transparency log. Identity count is bounded at 256.
+- Pending queues remain bounded and never expire automatically. Long outages
+  can leave records unsigned or lost to journal retention.
 - Deployment permissions and sandboxing are part of the security boundary and
   must be tested in Ghaf, including access to the Unix socket and signing key.
 

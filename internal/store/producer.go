@@ -50,9 +50,20 @@ type ProducerStore struct {
 	lastID                      [32]byte
 	lastCursor                  string
 	requireAuthenticatedBinding bool
+	boundary                    protocol.SealResponse
+	writeFailed                 bool
+	readOnly                    bool
 }
 
 func OpenProducer(root, chainID, sourceName string, supplied ...Limits) (*ProducerStore, error) {
+	return openProducer(root, chainID, sourceName, false, supplied...)
+}
+
+func ReadProducer(root, chainID, sourceName string, supplied ...Limits) (*ProducerStore, error) {
+	return openProducer(root, chainID, sourceName, true, supplied...)
+}
+
+func openProducer(root, chainID, sourceName string, readOnly bool, supplied ...Limits) (*ProducerStore, error) {
 	limits, err := chooseLimits(ProducerLimits(), supplied)
 	if err != nil {
 		return nil, err
@@ -60,6 +71,21 @@ func OpenProducer(root, chainID, sourceName string, supplied ...Limits) (*Produc
 	if root == "" || chainID == "" || sourceName == "" {
 		return nil, fmt.Errorf("producer state directory, chain ID and source name are required")
 	}
+	if !readOnly {
+		if err := os.MkdirAll(root, 0o750); err != nil {
+			return nil, err
+		}
+	}
+	var unlock func()
+	if readOnly {
+		unlock, err = Lock(root, false)
+	} else {
+		unlock, err = lockMutation(root)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	state := &ProducerStore{
 		root:       root,
 		chainID:    chainID,
@@ -67,10 +93,22 @@ func OpenProducer(root, chainID, sourceName string, supplied ...Limits) (*Produc
 		artifacts:  make(map[uint64]artifactSummary),
 		queued:     make(map[uint64]artifactSummary),
 		limits:     limits,
+		readOnly:   readOnly,
 	}
 	for _, dir := range []string{state.queueDir(), state.sealedDir()} {
+		if readOnly {
+			continue
+		}
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, fmt.Errorf("create producer state directory: %w", err)
+		}
+		if err := durable.CleanTemporary(dir); err != nil {
+			return nil, err
+		}
+	}
+	if !readOnly {
+		if err := durable.CleanTemporary(root); err != nil {
+			return nil, err
 		}
 	}
 	state.used, err = evidenceBytes(limits, state.queueDir(), state.sealedDir())
@@ -86,6 +124,9 @@ func OpenProducer(root, chainID, sourceName string, supplied ...Limits) (*Produc
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read pinned sealer key: %w", err)
 	}
+	if err := state.loadBoundary(); err != nil {
+		return nil, err
+	}
 	if err := state.loadSealed(); err != nil {
 		return nil, err
 	}
@@ -94,6 +135,28 @@ func OpenProducer(root, chainID, sourceName string, supplied ...Limits) (*Produc
 	}
 	if err := state.validateHistory(); err != nil {
 		return nil, err
+	}
+	if !readOnly {
+		for sequence := range state.artifacts {
+			path := artifactPath(state.queueDir(), sequence)
+			info, err := os.Stat(path)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if err := durable.Remove(path); err != nil {
+				return nil, err
+			}
+			state.used -= info.Size()
+		}
+		if err := state.cleanExpired(); err != nil {
+			return nil, err
+		}
+		if err := state.trimWindow(0, false); err != nil {
+			return nil, err
+		}
 	}
 	return state, nil
 }
@@ -124,6 +187,9 @@ func (state *ProducerStore) loadSealed() error {
 		if path != artifactPath(state.sealedDir(), block.ProducerSequence) {
 			return fmt.Errorf("sealed artifact filename mismatch")
 		}
+		if block.ProducerSequence <= state.boundary.ProducerSequence {
+			return nil
+		}
 		state.artifacts[block.ProducerSequence] = summary
 		return nil
 	})
@@ -145,6 +211,9 @@ func (state *ProducerStore) loadQueue() error {
 		}
 		if path != artifactPath(state.queueDir(), block.ProducerSequence) {
 			return fmt.Errorf("queued artifact filename mismatch")
+		}
+		if block.ProducerSequence <= state.boundary.ProducerSequence {
+			return fmt.Errorf("queued evidence precedes retained boundary")
 		}
 		if _, sealed := state.artifacts[block.ProducerSequence]; sealed {
 			// A crash after writing the sealed artifact but before removing the
@@ -169,7 +238,17 @@ func (state *ProducerStore) validateHistory() error {
 		return ErrCapacity
 	}
 	var previous [32]byte
-	for sequence := uint64(1); sequence <= uint64(count); sequence++ {
+	if state.boundary.ProducerSequence != 0 {
+		previous, _ = protocol.ParseBlockID(state.boundary.BlockID)
+		if len(state.artifacts) == 0 {
+			return fmt.Errorf("window boundary exists without retained sealed evidence")
+		}
+	}
+	for offset := uint64(1); offset <= uint64(count); offset++ {
+		sequence := state.boundary.ProducerSequence + offset
+		if sequence < offset {
+			return fmt.Errorf("producer sequence overflow")
+		}
 		summary, found := state.queued[sequence]
 		if entry, sealed := state.artifacts[sequence]; sealed {
 			summary, found = entry, true
@@ -192,7 +271,7 @@ func (state *ProducerStore) validateHistory() error {
 }
 
 func (state *ProducerStore) NextSequence() uint64 {
-	return uint64(len(state.artifacts)+len(state.queued)) + 1
+	return state.boundary.ProducerSequence + uint64(len(state.artifacts)+len(state.queued)) + 1
 }
 
 func (state *ProducerStore) PreviousBlockID() [32]byte { return state.lastID }
@@ -260,6 +339,17 @@ func (state *ProducerStore) Pending() (protocol.SealRequest, bool, error) {
 }
 
 func (state *ProducerStore) Enqueue(block protocol.Block) (protocol.SealRequest, error) {
+	unlock, err := lockMutation(state.root)
+	if err != nil {
+		return protocol.SealRequest{}, err
+	}
+	defer unlock()
+	if state.readOnly || state.writeFailed {
+		return protocol.SealRequest{}, fmt.Errorf("producer state is not writable; reopen before continuing")
+	}
+	if state.NextSequence() == 0 {
+		return protocol.SealRequest{}, fmt.Errorf("producer sequence exhausted")
+	}
 	if block.ChainID != state.chainID || block.SourceName != state.sourceName || block.ProducerSequence != state.NextSequence() || block.PreviousBlockID != state.lastID {
 		return protocol.SealRequest{}, fmt.Errorf("block does not extend producer history")
 	}
@@ -283,6 +373,9 @@ func (state *ProducerStore) Enqueue(block protocol.Block) (protocol.SealRequest,
 		return protocol.SealRequest{}, err
 	}
 	path := artifactPath(state.queueDir(), block.ProducerSequence)
+	if err := state.trimWindow(int64(2*len(data)+2048), true); err != nil {
+		return protocol.SealRequest{}, err
+	}
 	if len(state.artifacts)+len(state.queued) >= state.limits.Entries || int64(2*len(data)+2048) > state.limits.Bytes-state.used-state.reserved {
 		return protocol.SealRequest{}, ErrCapacity
 	}
@@ -291,6 +384,7 @@ func (state *ProducerStore) Enqueue(block protocol.Block) (protocol.SealRequest,
 		return protocol.SealRequest{}, err
 	}
 	if err := durable.WriteFile(path, data, 0o640); err != nil {
+		state.writeFailed = true
 		return protocol.SealRequest{}, err
 	}
 	state.queued[block.ProducerSequence] = summary
@@ -302,6 +396,14 @@ func (state *ProducerStore) Enqueue(block protocol.Block) (protocol.SealRequest,
 }
 
 func (state *ProducerStore) PersistSeal(request protocol.SealRequest, response protocol.SealResponse) error {
+	unlock, err := lockMutation(state.root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if state.readOnly || state.writeFailed {
+		return fmt.Errorf("producer state is not writable; reopen before continuing")
+	}
 	block, _, err := protocol.DecodeSealRequest(request)
 	if err != nil {
 		return err
@@ -313,6 +415,11 @@ func (state *ProducerStore) PersistSeal(request protocol.SealRequest, response p
 	}
 	if !found || queued.Digest != digest {
 		return fmt.Errorf("response is not for a pending request")
+	}
+	for sequence := range state.queued {
+		if sequence < block.ProducerSequence {
+			return fmt.Errorf("seals must be persisted in producer order")
+		}
 	}
 	if state.requireAuthenticatedBinding && state.pinnedKey == nil {
 		return fmt.Errorf("sealer key has no authenticated GIVC binding")
@@ -336,9 +443,11 @@ func (state *ProducerStore) PersistSeal(request protocol.SealRequest, response p
 		return ErrCapacity
 	}
 	if err := durable.WriteFile(artifactPath(state.sealedDir(), block.ProducerSequence), data, 0o640); err != nil {
+		state.writeFailed = true
 		return fmt.Errorf("persist sealed artifact: %w", err)
 	}
 	if err := durable.Remove(artifactPath(state.queueDir(), block.ProducerSequence)); err != nil {
+		state.writeFailed = true
 		return fmt.Errorf("remove queued artifact: %w", err)
 	}
 	delete(state.queued, block.ProducerSequence)
@@ -346,7 +455,7 @@ func (state *ProducerStore) PersistSeal(request protocol.SealRequest, response p
 	state.reserved -= queued.Size + 2048
 	queued.Size = int64(len(data))
 	state.artifacts[block.ProducerSequence] = queued
-	return nil
+	return state.trimWindow(0, false)
 }
 
 func (state *ProducerStore) queueDir() string  { return filepath.Join(state.root, "queue") }

@@ -76,7 +76,7 @@ type producerOptions struct {
 }
 
 func storageFlags(flags *flag.FlagSet, limits *store.Limits) {
-	flags.Int64Var(&limits.Bytes, "max-state-bytes", limits.Bytes, "maximum evidence file bytes (no automatic deletion)")
+	flags.Int64Var(&limits.Bytes, "max-state-bytes", limits.Bytes, "maximum evidence file bytes, including pending blocks")
 	flags.IntVar(&limits.Entries, "max-state-entries", limits.Entries, "maximum evidence entries")
 }
 
@@ -86,6 +86,7 @@ func runProducer(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("producer", flag.ContinueOnError)
 	options.limits = store.ProducerLimits()
 	storageFlags(flags, &options.limits)
+	flags.IntVar(&options.limits.WindowEntries, "window-entries", 20000, "maximum retained sealed blocks; zero disables expiry")
 	flags.StringVar(&options.revokedKeys, "revoked-peer-keys", "", "file of denied peer SPKI IDs; restart after updates")
 	flags.StringVar(&options.stateDir, "state-dir", "/var/lib/logseald/producer", "durable producer state directory")
 	flags.StringVar(&options.sourceName, "source", hostname, "source name stored in blocks")
@@ -122,6 +123,14 @@ func runProducer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(options.stateDir, 0o750); err != nil {
+		return err
+	}
+	unlock, err := store.Lock(options.stateDir, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	engine, err := producer.Open(options.stateDir, tlsutil.ChainID(leaf), options.sourceName, options.blockRecords, options.maxPending, options.limits)
 	if err != nil {
 		return err
@@ -240,6 +249,7 @@ func runSealer(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("sealer", flag.ContinueOnError)
 	limits := store.SealerLimits()
 	storageFlags(flags, &limits)
+	flags.BoolVar(&limits.Compact, "compact-state", true, "retain signed chain heads instead of full blocks")
 	flags.Int64Var(&limits.ChainBytes, "max-chain-bytes", limits.ChainBytes, "maximum ledger bytes per producer")
 	flags.IntVar(&limits.ChainEntries, "max-chain-entries", limits.ChainEntries, "maximum ledger entries per producer")
 	var revokedKeys string
@@ -261,6 +271,14 @@ func runSealer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(stateDir, 0o750); err != nil {
+		return err
+	}
+	unlock, err := store.Lock(stateDir, true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	state, err := store.OpenSealer(stateDir, limits)
 	if err != nil {
 		return err
@@ -369,11 +387,11 @@ func verifyProducer(args []string) error {
 	if err != nil {
 		return err
 	}
-	state, err := store.OpenProducer(stateDir, tlsutil.ChainID(leaf), sourceName, limits)
+	state, err := store.ReadProducer(stateDir, tlsutil.ChainID(leaf), sourceName, limits)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("PASS: producer history is valid: %d sealed, %d queued blocks, cursor %q\n", state.SealedCount(), state.QueueDepth(), state.LastCursor())
+	fmt.Printf("PASS: retained producer history is valid: %d sealed total, %d retained sealed, %d queued blocks, %d expired blocks, cursor %q\n", state.TotalSealed(), state.SealedCount(), state.QueueDepth(), state.ExpiredCount(), state.LastCursor())
 	return nil
 }
 
@@ -391,10 +409,14 @@ func verifySealer(args []string) error {
 	if _, err := os.Stat(filepath.Join(stateDir, "sealer.key")); err != nil {
 		return fmt.Errorf("sealer key is unavailable: %w", err)
 	}
-	state, err := store.OpenSealer(stateDir, limits)
+	state, err := store.ReadSealer(stateDir, limits)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("PASS: sealer ledger and signatures are valid: %d entries\n", state.EntryCount())
+	if chains, compact := state.CompactChains(); compact {
+		fmt.Printf("PASS: signed sealer checkpoint is valid: %d chain heads, %d total seals; historical blocks are not retained here\n", chains, state.EntryCount())
+	} else {
+		fmt.Printf("PASS: sealer ledger and signatures are valid: %d entries\n", state.EntryCount())
+	}
 	return nil
 }

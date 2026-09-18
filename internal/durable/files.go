@@ -5,8 +5,10 @@ package durable
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func WriteFile(path string, data []byte, mode os.FileMode) error {
@@ -69,4 +71,36 @@ func SyncDir(path string) error {
 		return fmt.Errorf("sync directory: %w", err)
 	}
 	return nil
+}
+
+func CleanTemporary(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for {
+		entries, readErr := f.ReadDir(256)
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), ".logseald-") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("non-regular temporary evidence file")
+			}
+			if err := Remove(filepath.Join(dir, entry.Name())); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }

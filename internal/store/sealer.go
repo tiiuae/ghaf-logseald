@@ -38,9 +38,19 @@ type SealerStore struct {
 	limits      Limits
 	used        int64
 	writeFailed bool
+	compact     *compactState
+	readOnly    bool
 }
 
 func OpenSealer(root string, supplied ...Limits) (*SealerStore, error) {
+	return openSealer(root, false, supplied...)
+}
+
+func ReadSealer(root string, supplied ...Limits) (*SealerStore, error) {
+	return openSealer(root, true, supplied...)
+}
+
+func openSealer(root string, readOnly bool, supplied ...Limits) (*SealerStore, error) {
 	limits, err := chooseLimits(SealerLimits(), supplied)
 	if err != nil {
 		return nil, err
@@ -48,25 +58,66 @@ func OpenSealer(root string, supplied ...Limits) (*SealerStore, error) {
 	if root == "" {
 		return nil, fmt.Errorf("sealer state directory is required")
 	}
+	if !readOnly {
+		if err := os.MkdirAll(root, 0o750); err != nil {
+			return nil, err
+		}
+	}
+	var unlock func()
+	if readOnly {
+		unlock, err = Lock(root, false)
+	} else {
+		unlock, err = lockMutation(root)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	state := &SealerStore{
 		root:     root,
 		nextSeal: 1,
 		heads:    make(map[string]chainHead),
 		requests: make(map[string]rememberedRequest),
 		limits:   limits,
+		readOnly: readOnly,
 	}
-	if err := os.MkdirAll(state.ledgerDir(), 0o750); err != nil {
-		return nil, fmt.Errorf("create sealer state directory: %w", err)
+	if !readOnly {
+		if err := os.MkdirAll(state.ledgerDir(), 0o750); err != nil {
+			return nil, fmt.Errorf("create sealer state directory: %w", err)
+		}
+		for _, dir := range []string{root, state.ledgerDir()} {
+			if err := durable.CleanTemporary(dir); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := state.loadOrCreateKey(); err != nil {
+		return nil, err
+	}
+	if found, err := state.loadCompact(); err != nil {
+		return nil, err
+	} else if found {
+		if !readOnly {
+			if err := state.ensureCompactFormat(); err != nil {
+				return nil, err
+			}
+			if err := state.cleanLedger(); err != nil {
+				return nil, err
+			}
+		}
+		return state, nil
 	}
 	state.used, err = evidenceBytes(limits, state.ledgerDir())
 	if err != nil {
 		return nil, err
 	}
-	if err := state.loadOrCreateKey(); err != nil {
-		return nil, err
-	}
 	if err := state.loadLedger(); err != nil {
 		return nil, err
+	}
+	if limits.Compact && !readOnly {
+		if err := state.migrateCompact(); err != nil {
+			return nil, err
+		}
 	}
 	return state, nil
 }
@@ -74,6 +125,21 @@ func OpenSealer(root string, supplied ...Limits) (*SealerStore, error) {
 func (state *SealerStore) loadOrCreateKey() error {
 	key, err := os.ReadFile(state.keyPath())
 	if errors.Is(err, os.ErrNotExist) {
+		if state.readOnly {
+			return fmt.Errorf("sealer signing key is missing")
+		}
+		entries, err := os.ReadDir(state.ledgerDir())
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return fmt.Errorf("refusing to replace a missing signing key with existing evidence")
+		}
+		for _, name := range []string{"checkpoint.json", "compact-format"} {
+			if _, err := os.Lstat(filepath.Join(state.root, name)); !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("refusing to replace a missing compact-state signing key")
+			}
+		}
 		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			return fmt.Errorf("generate sealer key: %w", err)
@@ -152,8 +218,19 @@ func (state *SealerStore) capacity(head chainHead, bytes int64, writing bool) er
 func (state *SealerStore) Seal(peerChainID string, request protocol.SealRequest) (protocol.SealResponse, error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	unlock, err := lockMutation(state.root)
+	if err != nil {
+		return protocol.SealResponse{}, err
+	}
+	defer unlock()
+	if state.readOnly {
+		return protocol.SealResponse{}, fmt.Errorf("sealer state is read only")
+	}
 	if state.writeFailed {
 		return protocol.SealResponse{}, fmt.Errorf("ledger write failed; restart to recover durable state")
+	}
+	if state.compact != nil {
+		return state.sealCompact(peerChainID, request)
 	}
 	if _, retry := state.requests[request.RequestID]; !retry && len(request.Body) > ((protocol.MaxLiveBlockBytes+2)/3)*4 {
 		return protocol.SealResponse{}, fmt.Errorf("live block exceeds size limit")

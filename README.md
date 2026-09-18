@@ -33,7 +33,7 @@ appearing in Grafana.
 | Role     | Location                          | Responsibility                                                                                                    |
 | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | Producer | Host and every logging-enabled VM | Read local journal records, build chained blocks, queue them durably, and verify returned seals                   |
-| Sealer   | `admin-vm`                        | Authenticate producers, validate complete blocks, enforce chain order, sign seals, and persist the central ledger |
+| Sealer   | `admin-vm`                        | Authenticate producers, validate complete blocks, enforce chain order, sign seals, and persist signed chain heads |
 
 The producer reads the journal export stream and preserves duplicate and binary
 fields. It creates a canonical encoding for each record, calculates a Merkle
@@ -44,15 +44,18 @@ The producer submits the complete block over mutually authenticated TLS. The
 sealer decodes the records and recomputes the Merkle root and block identifier.
 It also checks the producer sequence and predecessor against the authenticated
 chain head. Accepted blocks receive a device-wide seal sequence and an Ed25519
-signature. The sealer writes the ledger entry to durable storage before it
-returns the seal.
+signature. The sealer atomically persists a signed checkpoint of the current
+chain heads before returning the seal. Full block contents are validated in
+memory but are not retained centrally.
 
 The sealer certifies its Ed25519 signing key with the authenticated GIVC
 transport key. The producer verifies this binding against the GIVC certificate
 from the TLS connection before it pins the signing key or accepts a seal. It
 then stores the sealed artifact and removes the queued request. Repeated
-delivery of the same request returns the original seal. A request identifier
-reused with different content is rejected.
+delivery of the latest request for a chain returns its original seal, including
+after restart. Older requests are rejected rather than signed again. Producers
+submit pending blocks in order, one at a time. Other chains cannot evict this
+last-response retry state.
 
 ## Offline and Clock-Independent Operation
 
@@ -133,19 +136,50 @@ stored in that marker. Malformed framing is rejected; normal journal forwarding
 is unchanged. Batches close on byte, count, duration or boot-ID boundaries.
 
 The sealer admits one body at a time, limits HTTP bodies to 2 MiB and uses a
-16-connection proxy. State bodies are read one at a time; history/replay indexes
-have bounded entry counts. Producer `maxStateBytes`/`maxStateEntries` default to
-256 MiB/100000; sealer defaults to 1 GiB/100000, with `maxChainBytes` and
-`maxChainEntries` of 128 MiB/20000 per producer. Producer admission reserves space
-for seal persistence. A producer at evidence capacity stops with exit status 75
-(no automatic restart); the sealer rejects new work but preserves identical
-retries. Journald may rotate unsealed records during a prolonged pause.
+16-connection proxy. Producers retain up to 20000 sealed blocks by default
+(`--window-entries`), within their 256 MiB evidence budget and 100000-entry
+limit. Byte pressure may shorten that window. At one block every five seconds,
+20000 blocks is approximately 28 hours, not a guaranteed time period. Expiry
+uses sequence numbers and byte counts, never wall time or Internet connectivity.
 
-There is no automatic pruning or checkpoint protocol. Provision disk capacity
-and increase limits before they fill, then restart. Do not delete active evidence
-or reset keys/counters. These quotas cover evidence file bytes, not filesystem
-overhead or other services. At one block every five seconds, 20000 blocks covers
-only about 28 hours, less under heavier traffic. Monitor both bytes and entries.
+Only acknowledged sealed blocks expire. Before removing an old block, the
+producer durably stores its signed receipt as the chain boundary. At least one
+sealed block is retained for cursor recovery. Pending blocks are never expired,
+and admission reserves room for their receipts. When pending evidence or a
+single block cannot fit, ingestion still stops with status 75. Journald may
+rotate unconsumed records during a prolonged outage.
+
+The sealer's default `--compact-state=true` keeps one signed head/last receipt
+per chain in a signed atomic checkpoint, capped at 256 identities and 1 MiB.
+Atomic replacement temporarily requires a second copy, and the configured byte
+budget must cover both. Old identities are not automatically forgotten: doing
+so would allow replay of their initial chains. Reaching the identity cap rejects
+new identities but existing chains continue. Key rotation therefore requires
+planned identity/state management. Per-chain legacy byte/entry limits apply
+during migration only, not to the lifetime number of compact-mode seals.
+
+This is bounded retained evidence, not unlimited audit history. Once blocks
+expire, their contents cannot be verified or recovered locally. The boundary
+commits to their history but does not archive it. Grafana visibility is not an
+archive acknowledgment, and log forwarding does not control expiry. Keeping
+older verifiable evidence requires separately archiving records, receipts and
+trusted references before expiry.
+
+Upgrade automatically verifies the legacy ledger, persists the compact
+checkpoint, then removes legacy full-block entries. Producers automatically
+expire acknowledged history to their configured window. Back up evidence before
+upgrading if historical verification is required. This storage migration is
+one-way: do not restart the old binary against migrated state. Wire block/seal
+formats remain v1, keys and counters are preserved, and state survives reboots.
+Use `--window-entries=0` to disable further producer expiry. That cannot recover
+expired evidence. Existing compact state remains compact even if the legacy
+mode flag is later selected.
+
+Quotas cover evidence content bytes, not filesystem allocation overhead. Producer
+boundary/pin/lock metadata and temporary atomic-replacement files require
+additional bounded headroom. Runtime writers are exclusive, and verification
+takes a shared state lock so it cannot race window cleanup. Verification does
+not migrate, prune, reset counters or create signing keys.
 
 Systemd producer `MemoryHigh`/`MemoryMax` are 192/256 MiB (including journalctl);
 sealer limits are 256/384 MiB, with swap disabled for both. These are containment
@@ -177,7 +211,8 @@ also change chain identity; never silently reset an existing chain during rotati
 | Admin VM listener | `logseald-sealer.socket`, `logseald-sealer-proxy.service` | `/run/logseald-sealer/sealer.sock`  |
 
 Producer state contains queued requests, sealed artifacts, and the pinned
-sealer public key. Sealer state contains the signing key and append-only ledger.
+sealer public key, and a signed boundary receipt after expiry. Sealer state
+contains the signing key and compact signed chain checkpoint.
 
 ## Verification
 
@@ -199,7 +234,7 @@ sudo logseald verify-producer \
   --source net-vm
 ```
 
-Verify the central ledger in `admin-vm`:
+Verify the compact checkpoint in `admin-vm`:
 
 For other producers, use the `--source` and state directory from
 `systemctl show logseald-producer.service -p ExecStart --no-pager`.
@@ -215,7 +250,8 @@ predecessor, a sequence, a pinned key, or a signature is invalid.
 ## Security Properties and Limitations
 
 Logseald detects modification, insertion, reordering, gaps, and forks within
-the retained producer and sealer evidence. Mutual TLS prevents an unauthenticated
+the retained producer evidence. Compact sealer verification checks the signed
+checkpoint and current chain heads, not expired blocks or an entire global log. Mutual TLS prevents an unauthenticated
 node from claiming another producer chain. Durable writes and idempotent retries
 preserve a single accepted history across process failures.
 
@@ -224,8 +260,10 @@ event, prove that an event is truthful, or prevent a compromised producer from
 stopping. The software signing key and ledger do not provide hardware-backed
 rollback resistance. Restoring or deleting a complete trailing state can escape
 local detection. Static certificate verification does not enforce expiration or
-fetch online revocation data. Evidence retains records or oversized-entry markers and
-has no automatic pruning policy.
+fetch online revocation data. The producer verification report distinguishes retained sealed blocks, pending
+blocks and expired history. A valid boundary does not prove that an attacker
+has not removed a longer prefix or rolled back the entire retained state.
+An independently retained recent reference is needed to detect such losses.
 
 Compromise of the Admin VM GIVC private key or CA can authorize a different
 signing-key binding. Port reservation depends on PID 1 and the socket unit; an
