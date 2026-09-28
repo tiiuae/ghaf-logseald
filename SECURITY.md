@@ -12,6 +12,12 @@ Persist queued blocks before advancing cursors; persist seals before acknowledgi
 or removing queued evidence. Identical retries must preserve the accepted history.
 Keep resource bounds and fail-closed behavior at capacity and on malformed input.
 
+`--reset-on-credential-change` explicitly opts out of evidence retention across
+credential epochs and discards legacy state on its first use. Producer-key or
+CA-bundle changes reset producer state; CA-bundle changes also reset sealer state.
+Ordering, replay protection and signing-key pins then cover only the new epoch.
+This policy must be deployed to all peers together.
+
 The sealer's GIVC identity and CA anchor initial trust. Its separate Ed25519 key
 signs evidence. The default clock-independent TLS mode does not enforce current
 certificate expiry; explicit revocation requires policy deployment and restart.

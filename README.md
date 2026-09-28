@@ -83,6 +83,32 @@ The NixOS module passes these files to the unprivileged services through systemd
 credentials. The SHA-256 fingerprint of the authenticated certificate public
 key identifies the producer chain.
 
+### Discarding State When Credentials Change
+
+Both daemons accept `--reset-on-credential-change`. This is opt-in; without it,
+the existing durable-state and identity checks remain unchanged. Enable it on
+all producers and the sealer when old sealing evidence need not survive GIVC
+credential regeneration.
+
+The producer starts fresh when its public key or CA bundle changes. The sealer
+starts fresh, with a new signing key and empty chain heads, when its CA bundle
+changes. Service restarts and leaf certificate renewals using the same key and
+CA bundle keep the current state. A reboot that keeps those credentials also
+keeps the chain; this policy does not reset on every boot unconditionally.
+
+The first start with this flag discards legacy state without a credential-epoch
+marker. Each reset is logged and permanently removes old sealed evidence,
+pending blocks and the journal cursor. Retained journal records are read again
+for the new chain. There is no continuity or replay-history guarantee between
+credential epochs. Deploy the policy to all peers and restart them together;
+resetting only the sealer leaves existing producers pinned to its old key.
+
+The CA bundle is fingerprinted as file bytes, so replacing or editing that
+bundle starts a new epoch even if some CA certificates remain trusted. The
+marker is committed only after old state is removed, allowing an interrupted
+reset to finish on restart. Ordinary evidence corruption does not trigger reset
+when the credential epoch is unchanged.
+
 GUI and app-VM GIVC clients also receive this private key with user-readable
 permissions. Such users can impersonate logseald; private systemd credential
 copies do not remove that access. The current identity authenticates a VM key

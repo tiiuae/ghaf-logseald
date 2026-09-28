@@ -68,6 +68,7 @@ func usage() {
 }
 
 type producerOptions struct {
+	resetOnCredentialChange                                                                       bool
 	stateDir, sourceName, endpoint, certFile, keyFile, caFile, serverName, timePolicy, journalctl string
 	blockRecords, maxPending                                                                      int
 	blockInterval, retryInterval, requestTimeout                                                  time.Duration
@@ -85,6 +86,7 @@ func runProducer(ctx context.Context, args []string) error {
 	options := producerOptions{}
 	flags := flag.NewFlagSet("producer", flag.ContinueOnError)
 	options.limits = store.ProducerLimits()
+	flags.BoolVar(&options.resetOnCredentialChange, "reset-on-credential-change", false, "discard prior sealing state when the producer key or CA bundle changes; initializes legacy state once")
 	storageFlags(flags, &options.limits)
 	flags.IntVar(&options.limits.WindowEntries, "window-entries", 20000, "maximum retained sealed blocks; zero disables expiry")
 	flags.StringVar(&options.revokedKeys, "revoked-peer-keys", "", "file of denied peer SPKI IDs; restart after updates")
@@ -123,6 +125,10 @@ func runProducer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	tlsConfig, err := tlsutil.ClientConfig(options.certFile, options.keyFile, options.caFile, options.serverName, policy, options.revokedKeys)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(options.stateDir, 0o750); err != nil {
 		return err
 	}
@@ -131,11 +137,12 @@ func runProducer(ctx context.Context, args []string) error {
 		return err
 	}
 	defer unlock()
-	engine, err := producer.Open(options.stateDir, tlsutil.ChainID(leaf), options.sourceName, options.blockRecords, options.maxPending, options.limits)
-	if err != nil {
-		return err
+	if options.resetOnCredentialChange {
+		if err := prepareCredentialEpoch(options.stateDir, "producer", options.caFile, leaf); err != nil {
+			return err
+		}
 	}
-	tlsConfig, err := tlsutil.ClientConfig(options.certFile, options.keyFile, options.caFile, options.serverName, policy, options.revokedKeys)
+	engine, err := producer.Open(options.stateDir, tlsutil.ChainID(leaf), options.sourceName, options.blockRecords, options.maxPending, options.limits)
 	if err != nil {
 		return err
 	}
@@ -247,6 +254,8 @@ func (state *submissionState) submitOne(ctx context.Context, engine *producer.En
 
 func runSealer(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("sealer", flag.ContinueOnError)
+	var resetOnCredentialChange bool
+	flags.BoolVar(&resetOnCredentialChange, "reset-on-credential-change", false, "discard prior sealing state when the CA bundle changes; initializes legacy state once")
 	limits := store.SealerLimits()
 	storageFlags(flags, &limits)
 	flags.BoolVar(&limits.Compact, "compact-state", true, "retain signed chain heads instead of full blocks")
@@ -271,6 +280,10 @@ func runSealer(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	tlsConfig, err := tlsutil.ServerConfig(certFile, keyFile, caFile, policy, revokedKeys)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		return err
 	}
@@ -279,6 +292,11 @@ func runSealer(ctx context.Context, args []string) error {
 		return err
 	}
 	defer unlock()
+	if resetOnCredentialChange {
+		if err := prepareCredentialEpoch(stateDir, "sealer", caFile, nil); err != nil {
+			return err
+		}
+	}
 	state, err := store.OpenSealer(stateDir, limits)
 	if err != nil {
 		return err
@@ -300,10 +318,6 @@ func runSealer(ctx context.Context, args []string) error {
 		return fmt.Errorf("bind sealer key to GIVC identity: %w", err)
 	}
 	keyBindingHeader, err := protocol.EncodeKeyBindingHeader(keyBinding)
-	if err != nil {
-		return err
-	}
-	tlsConfig, err := tlsutil.ServerConfig(certFile, keyFile, caFile, policy, revokedKeys)
 	if err != nil {
 		return err
 	}
